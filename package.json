@@ -2,7 +2,7 @@
     "name": "makerom",
     "description": "Embedthis Makerom",
     "title": "Embedthis Makerom",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "keywords": [
         "makerom",
         "mpr"
@@ -30,11 +30,11 @@
         }
     ],
     "dependencies": {
-        "mpr": "~6.0"
+        "mpr": "~6"
     },
     "devDependencies": {
-        "makeme": ">=0.9.0",
-        "pak": ">=0.11.0"
+        "makeme": ">=0.10.0",
+        "pak": ">=0.12.0"
     },
     "files": [
         "dist/**"

@@ -12,19 +12,17 @@
 
 /**************************** Forward Declarations ****************************/
 
-static void printUsage(Mpr *mpr);
+static void printUsage();
 static int  binToC(MprList *files, char *romName, char *prefix);
 
 /*********************************** Code *************************************/
-/*
-    Main program
- */ 
 
 int main(int argc, char **argv)
 {
     Mpr         *mpr;
     MprList     *files;
-    char        *argp, *prefix, *romName;
+    FILE        *fp;
+    char        *argp, *prefix, *romName, *fileList, *path, fbuf[ME_MAX_FNAME];
     int         nextArg, err;
 
     mpr = mprCreate(argc, argv, 0);
@@ -33,36 +31,54 @@ int main(int argc, char **argv)
     prefix = "";
     romName = "romFiles";
     files = mprCreateList(-1, 0);
+    fileList = 0;
 
     for (nextArg = 1; nextArg < argc; nextArg++) {
         argp = argv[nextArg];
         if (*argp != '-') {
             break;
         }
-        if (strcmp(argp, "--prefix") == 0) {
+        if (smatch(argp, "--files")) {
+            if (nextArg >= argc) {
+                err++;
+            } else {
+                fileList = argv[++nextArg];
+            }
+        } else if (smatch(argp, "--name")) {
+            if (nextArg >= argc) {
+                err++;
+            } else {
+                romName = argv[++nextArg];
+            }
+        } else if (smatch(argp, "--prefix")) {
             if (nextArg >= argc) {
                 err++;
             } else {
                 prefix = argv[++nextArg];
             }
 
-        } else if (strcmp(argp, "--name") == 0) {
-            if (nextArg >= argc) {
-                err++;
-            } else {
-                romName = argv[++nextArg];
-            }
+        } else {
+            printUsage();
+            return MPR_ERR;
         }
     }
-    if (nextArg >= argc) {
-        err++;
+    if (fileList) {
+        if ((fp = fopen(fileList, "r")) == 0) {
+            mprLog("error makerom", 0, "Cannot open file list %s", fileList);
+            return MPR_ERR;
+        }
+        while (fgets(fbuf, sizeof(fbuf), fp) != NULL) {
+            path = strim(fbuf, "\r\n", 0);
+            mprAddItem(files, path);
+        }
+        fclose(fp);
     }
-    if (err) {
-        printUsage(mpr);
-        exit(2);
-    }   
     while (nextArg < argc) {
         mprAddItem(files, argv[nextArg++]);
+    }
+    if (mprGetListLength(files) == 0) {
+        printUsage();
+        return MPR_ERR;
     }
     if (binToC(files, romName, prefix) < 0) {
         return MPR_ERR;
@@ -71,12 +87,13 @@ int main(int argc, char **argv)
 }
 
 
-static void printUsage(Mpr *mpr)
+static void printUsage()
 {
     mprEprintf("usage: makerom [options] files... >output.c\n");
     mprEprintf("  Makerom options:\n");
-    mprEprintf("  --prefix prefix       # File prefix to remove\n");
+    mprEprintf("  --files fileList      # List of files\n");
     mprEprintf("  --name structName     # Name of top level C struct\n");
+    mprEprintf("  --prefix prefix       # File prefix to remove\n");
 }
 
 
@@ -87,7 +104,7 @@ static int binToC(MprList *files, char *romName, char *prefix)
 {
     struct stat     sbuf;
     char            buf[512];
-    char            *filename, *cp, *sl, *p;
+    char            *filename, *p, *name;
     ssize           len;
     int             fd, next, i, j;
 
@@ -130,31 +147,21 @@ static int binToC(MprList *files, char *romName, char *prefix)
     mprPrintf("PUBLIC MprRomInode %s[] = {\n", romName);
 
     for (next = 0; (filename = mprGetNextItem(files, &next)) != 0; ) {
-        /*
-            Replace the prefix with a leading "/"
-         */ 
-        if (strncmp(filename, prefix, strlen(prefix)) == 0) {
-            cp = &filename[strlen(prefix)];
-        } else {
-            cp = filename;
-        }
-        while((sl = strchr(filename, '\\')) != NULL) {
-            *sl = '/';
-        }
-        if (*cp == '/') {
-            cp++;
-        }
-        if (*cp == '.' && cp[1] == '\0') {
-            cp++;
-        }
+        name = sncmp(filename, prefix, slen(prefix)) == 0 ? &filename[slen(prefix)] : filename;
+        name = mprGetRelPath(name, 0);
+        name = sjoin("/", name, NULL);
+        name = mprNormalizePath(name);
+        mprMapSeparators(name, '/');
         if (stat(filename, &sbuf) == 0 && sbuf.st_mode & S_IFDIR) {
-            mprPrintf("    { \"%s\", 0, 0, 0 },\n", cp);
+            mprPrintf("    { \"%s\", 0, 0, 0 },\n", name);
             continue;
         }
-        mprPrintf("    { \"%s\", _file_%d, %d, %d },\n", cp, next, (int) sbuf.st_size, next);
+        mprPrintf("    { \"%s\", _file_%d, %d, %d },\n", name, next, (int) sbuf.st_size, next);
     }
     mprPrintf("    { 0, 0, 0, 0 },\n");
     mprPrintf("};\n");
+    mprPrintf("#else\n");
+    mprPrintf("PUBLIC int romDummy;\n");
     mprPrintf("#endif /* ME_ROM */\n");
     return 0;
 }
