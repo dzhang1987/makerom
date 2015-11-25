@@ -1017,6 +1017,9 @@ PUBLIC void mprYield(int flags)
     assert(!tp->yielded);
     assert(!tp->stickyYield);
 
+    if (tp->noyield) {
+        return;
+    }
     if (flags & MPR_YIELD_STICKY) {
         tp->stickyYield = 1;
         tp->yielded = 1;
@@ -1076,7 +1079,7 @@ PUBLIC void mprResetYield()
         mprLog("error mpr memory", 0, "Yield called from an unknown thread");
         return;
     }
-    assert(tp->stickyYield);
+    assert(tp->stickyYield || tp->noyield);
     if (tp->stickyYield) {
         /*
             Marking could have started again while sticky yielded. So must yield here regardless.
@@ -1106,7 +1109,7 @@ static int pauseThreads()
     MprThreadService    *ts;
     MprThread           *tp;
     MprTicks            start;
-    int                 i, allYielded, timeout;
+    int                 i, allYielded, timeout, noyield;
 
     /*
         Short timeout wait for all threads to yield. Typically set to 1/10 sec
@@ -1122,10 +1125,14 @@ static int pauseThreads()
     do {
         lock(ts->threads);
         allYielded = 1;
+        noyield = 0;
         for (i = 0; i < ts->threads->length; i++) {
             tp = (MprThread*) mprGetItem(ts->threads, i);
             if (!tp->yielded) {
                 allYielded = 0;
+                if (tp->noyield) {
+                    noyield = 1;
+                }
                 break;
             }
         }
@@ -1135,7 +1142,7 @@ static int pauseThreads()
             break;
         }
         unlock(ts->threads);
-        if (mprGetState() >= MPR_DESTROYING) {
+        if (noyield || mprGetState() >= MPR_DESTROYING) {
             /* Do not wait for paused threads if shutting down */
             break;
         }
@@ -1180,7 +1187,7 @@ static void resumeThreads(int flags)
 
 
 /*
-    Garbage collector sweeper main thread
+    Garbage collector main thread
  */
 static void sweeperThread(void *unused, MprThread *tp)
 {
@@ -1210,14 +1217,15 @@ static void sweeperThread(void *unused, MprThread *tp)
  */
 static void markAndSweep()
 {
-    static int warnOnce = 0;
-
     if (!pauseThreads()) {
+#if KEEP
+        static int warnOnce = 0;
         if (warnOnce == 0 && !mprGetDebugMode() && !mprIsStopping()) {
             warnOnce = 1;
             mprLog("error mpr memory", 6, "GC synchronization timed out, some threads did not yield.");
             mprLog("error mpr memory", 6, "If debugging, run the process with -D to enable debug mode.");
         }
+#endif
         resumeThreads(YIELDED_THREADS | WAITING_THREADS);
         return;
     }
@@ -2563,9 +2571,10 @@ static int mprState;
 
 /**************************** Forward Declarations ****************************/
 
+static int initStdio(Mpr *mpr, MprFileSystem *fs);
 static void manageMpr(Mpr *mpr, int flags);
 static void serviceEventsThread(void *data, MprThread *tp);
-static void setNames(Mpr *mpr, int argc, char **argv);
+static void setArgs(Mpr *mpr, int argc, char **argv);
 
 /************************************* Code ***********************************/
 /*
@@ -2573,8 +2582,8 @@ static void setNames(Mpr *mpr, int argc, char **argv);
  */
 PUBLIC Mpr *mprCreate(int argc, char **argv, int flags)
 {
-    MprFileSystem   *fs;
     Mpr             *mpr;
+    MprFileSystem   *fs;
 
     srand((uint) time(NULL));
 
@@ -2591,17 +2600,18 @@ PUBLIC Mpr *mprCreate(int argc, char **argv, int flags)
     mpr->exitStrategy = 0;
     mpr->emptyString = sclone("");
     mpr->oneString = sclone("1");
-    mpr->rootString = sclone("/");
     mpr->idleCallback = mprServicesAreIdle;
     mpr->mimeTypes = mprCreateMimeTypes(NULL);
     mpr->terminators = mprCreateList(0, MPR_LIST_STATIC_VALUES);
     mpr->keys = mprCreateHash(0, 0);
     mpr->verifySsl = 1;
+    mpr->fileSystems = mprCreateList(0, 0);
 
-    fs = mprCreateFileSystem("/");
+    fs = mprCreateDiskFileSystem("/");
     mprAddFileSystem(fs);
-    setNames(mpr, argc, argv);
+    initStdio(mpr, fs);
 
+    setArgs(mpr, argc, argv);
     mprCreateOsService();
     mprCreateTimeService();
     mpr->mutex = mprCreateLock();
@@ -2675,7 +2685,7 @@ static void manageMpr(Mpr *mpr, int flags)
         mprMark(mpr->serverName);
         mprMark(mpr->cmdService);
         mprMark(mpr->eventService);
-        mprMark(mpr->fileSystem);
+        mprMark(mpr->fileSystems);
         mprMark(mpr->moduleService);
         mprMark(mpr->osService);
         mprMark(mpr->signalService);
@@ -2694,11 +2704,40 @@ static void manageMpr(Mpr *mpr, int flags)
         mprMark(mpr->mutex);
         mprMark(mpr->spin);
         mprMark(mpr->cond);
+        mprMark(mpr->romfs);
         mprMark(mpr->stopCond);
-        mprMark(mpr->rootString);
         mprMark(mpr->emptyString);
         mprMark(mpr->oneString);
     }
+}
+
+
+static int initStdio(Mpr *mpr, MprFileSystem *fs)
+{
+    if ((mpr->stdError = mprAllocStruct(MprFile)) == 0) {
+        return MPR_ERR_MEMORY;
+    }
+    mprSetName(mpr->stdError, "stderr");
+    mpr->stdError->fd = 2;
+    mpr->stdError->fileSystem = fs;
+    mpr->stdError->mode = O_WRONLY;
+
+    if ((mpr->stdInput = mprAllocStruct(MprFile)) == 0) {
+        return MPR_ERR_MEMORY;
+    }
+    mprSetName(mpr->stdInput, "stdin");
+    mpr->stdInput->fd = 0;
+    mpr->stdInput->fileSystem = fs;
+    mpr->stdInput->mode = O_RDONLY;
+
+    if ((mpr->stdOutput = mprAllocStruct(MprFile)) == 0) {
+        return MPR_ERR_MEMORY;
+    }
+    mprSetName(mpr->stdOutput, "stdout");
+    mpr->stdOutput->fd = 1;
+    mpr->stdOutput->fileSystem = fs;
+    mpr->stdOutput->mode = O_WRONLY;
+    return 0;
 }
 
 
@@ -2723,7 +2762,7 @@ static void shutdownMonitor(void *data, MprEvent *event)
         if (MPR->exitStrategy & MPR_EXIT_SAFE && mprCancelShutdown()) {
             mprLog("warn mpr", 2, "Shutdown cancelled due to continuing requests");
         } else {
-            mprLog("warn mpr", 2, "Timeout while waiting for requests to complete");
+            mprLog("warn mpr", 6, "Timeout while waiting for requests to complete");
             if (mprState <= MPR_STOPPING) {
                 mprState = MPR_STOPPED;
             }
@@ -2773,7 +2812,7 @@ PUBLIC void mprShutdown(int how, int exitStatus, MprTicks timeout)
         }
         /* No continue */
     }
-    mprLog("info mpr", 3, "Application exit, waiting for existing requests to complete.");
+    mprLog("info mpr", 5, "Application exit, waiting for existing requests to complete.");
 
     if (!mprIsIdle(0)) {
         mprCreateTimerEvent(NULL, "shutdownMonitor", 0, shutdownMonitor, 0, MPR_EVENT_QUICK);
@@ -2878,7 +2917,9 @@ PUBLIC bool mprDestroy()
     }
     mprState = MPR_DESTROYED;
 
-    mprLog("info mpr", 2, (MPR->exitStrategy & MPR_EXIT_RESTART) ? "Restarting" : "Exiting");
+    if (MPR->exitStrategy & MPR_EXIT_RESTART) {
+        mprLog("info mpr", 2, "Restarting");
+    }
     mprStopModuleService();
     mprStopSignalService();
     mprStopGCService();
@@ -2892,7 +2933,7 @@ PUBLIC bool mprDestroy()
 }
 
 
-static void setNames(Mpr *mpr, int argc, char **argv)
+static void setArgs(Mpr *mpr, int argc, char **argv)
 {
     if (argv) {
 #if ME_WIN_LIKE
@@ -6221,9 +6262,10 @@ static void reapCmd(MprCmd *cmd, bool finalizing)
                 cmd->status = WTERMSIG(status);
             }
             cmd->pid = 0;
-            assert(cmd->signal);
-            mprRemoveSignalHandler(cmd->signal);
-            cmd->signal = 0;
+            if (cmd->signal) {
+                mprRemoveSignalHandler(cmd->signal);
+                cmd->signal = 0;
+            }
         }
     } else {
         mprDebug("mpr cmd", 5, "Still running pid %d, thread %s", cmd->pid, mprGetCurrentThreadName());
@@ -8813,52 +8855,118 @@ PUBLIC char *mprGetPassword(cchar *prompt)
 
 
 
-#if !ME_ROM
+#if ME_MPR_DISK
 /*********************************** Defines **********************************/
 
 #if WINDOWS
-/*
-    Open/Delete retries to circumvent windows pending delete problems
- */
-#define RETRIES 40
+    /*
+        Open/Delete retries to circumvent windows pending delete problems
+     */
+    #define RETRIES 40
 
-/*
-    Windows only permits owner bits
- */
-#define MASK_PERMS(perms)    perms & 0600
+    /*
+        Windows only permits owner bits
+     */
+    #define MASK_PERMS(perms)   perms & 0600
 #else
-#define MASK_PERMS(perms)    perms
+    #define MASK_PERMS(perms)   perms
 #endif
 
 /********************************** Forwards **********************************/
 
-static int closeFile(MprFile *file);
 static void manageDiskFile(MprFile *file, int flags);
-static int getPathInfo(MprDiskFileSystem *fs, cchar *path, MprPath *info);
+static int disk_getPathInfo(MprDiskFileSystem *fs, cchar *path, MprPath *info);
 
 /************************************ Code ************************************/
-#if KEEP
-/*
-    Open a file with support for cygwin paths. Tries windows path first then under /cygwin.
- */
-static int cygOpen(MprFileSystem *fs, cchar *path, int omode, int perms)
-{
-    int     fd;
 
-    fd = open(path, omode, MASK_PERMS(perms));
-#if WINDOWS
-    if (fd < 0) {
+static void manageDiskFile(MprFile *file, int flags)
+{
+    if (flags & MPR_MANAGE_MARK) {
+        mprMark(file->path);
+        mprMark(file->fileSystem);
+        mprMark(file->buf);
+#if ME_ROM
+        mprMark(file->inode);
+#endif
+
+    } else if (flags & MPR_MANAGE_FREE) {
+        if (file->fd >= 0) {
+            close(file->fd);
+            file->fd = -1;
+        }
+    }
+}
+
+
+static bool disk_accessPath(MprDiskFileSystem *fs, cchar *path, int omode)
+{
+#if ME_WIN && KEEP
+    if (access(path, omode) < 0) {
         if (*path == '/') {
             path = sjoin(fs->cygwin, path, NULL);
         }
-        fd = open(path, omode, MASK_PERMS(perms));
     }
 #endif
-    return fd;
+    return access(path, omode) == 0;
 }
-#endif
 
-static MprFile *openFile(MprFileSystem *fs, cchar *path, int omode, int perms)
+
+/*
+    WARNING: this may be called by finalizers, so no blocking or locking
+ */
+static int disk_closeFile(MprFile *file)
+{
+    MprBuf  *bp;
+
+    assert(file);
+
+    if (file == 0) {
+        return 0;
+    }
+    bp = file->buf;
+    if (bp && (file->mode & (O_WRONLY | O_RDWR))) {
+        mprFlushFile(file);
+    }
+    if (file->fd >= 0) {
+        close(file->fd);
+        file->fd = -1;
+    }
+    return 0;
+}
+
+
+static int disk_deletePath(MprDiskFileSystem *fs, cchar *path)
+{
+    MprPath     info;
+
+    if (disk_getPathInfo(fs, path, &info) == 0 && info.isDir && !info.isLink) {
+        return rmdir((char*) path);
+    }
+#if WINDOWS
+{
+    /*
+        NOTE: Windows delete makes a file pending delete which prevents immediate recreation. Rename and then delete.
+     */
+    int i, err;
+    for (i = 0; i < RETRIES; i++) {
+        if (DeleteFile(wide(path)) != 0) {
+            return 0;
+        }
+        err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION) {
+            break;
+        }
+        mprNap(10);
+    }
+    return MPR_ERR_CANT_DELETE;
+}
+#else
+    return unlink((char*) path);
+#endif
+}
+
+
+static MprFile *disk_openFile(MprFileSystem *fs, cchar *path, int omode, int perms)
 {
     MprFile     *file;
 
@@ -8897,49 +9005,7 @@ static MprFile *openFile(MprFileSystem *fs, cchar *path, int omode, int perms)
 }
 
 
-static void manageDiskFile(MprFile *file, int flags)
-{
-    if (flags & MPR_MANAGE_MARK) {
-        mprMark(file->path);
-        mprMark(file->fileSystem);
-        mprMark(file->buf);
-#if ME_ROM
-        mprMark(file->inode);
-#endif
-    } else if (flags & MPR_MANAGE_FREE) {
-        if (file->fd >= 0) {
-            close(file->fd);
-            file->fd = -1;
-        }
-    }
-}
-
-
-/*
-    WARNING: this may be called by finalizers, so no blocking or locking
- */
-static int closeFile(MprFile *file)
-{
-    MprBuf  *bp;
-
-    assert(file);
-
-    if (file == 0) {
-        return 0;
-    }
-    bp = file->buf;
-    if (bp && (file->mode & (O_WRONLY | O_RDWR))) {
-        mprFlushFile(file);
-    }
-    if (file->fd >= 0) {
-        close(file->fd);
-        file->fd = -1;
-    }
-    return 0;
-}
-
-
-static ssize readFile(MprFile *file, void *buf, ssize size)
+static ssize disk_readFile(MprFile *file, void *buf, ssize size)
 {
     assert(file);
     assert(buf);
@@ -8948,7 +9014,7 @@ static ssize readFile(MprFile *file, void *buf, ssize size)
 }
 
 
-static ssize writeFile(MprFile *file, cvoid *buf, ssize count)
+static ssize disk_writeFile(MprFile *file, cvoid *buf, ssize count)
 {
     assert(file);
     assert(buf);
@@ -8961,7 +9027,7 @@ static ssize writeFile(MprFile *file, cvoid *buf, ssize count)
 }
 
 
-static MprOff seekFile(MprFile *file, int seekType, MprOff distance)
+static MprOff disk_seekFile(MprFile *file, int seekType, MprOff distance)
 {
     assert(file);
 
@@ -8978,51 +9044,131 @@ static MprOff seekFile(MprFile *file, int seekType, MprOff distance)
 }
 
 
-static bool accessPath(MprDiskFileSystem *fs, cchar *path, int omode)
+static void manageDirEntry(MprDirEntry *dp, int flags)
 {
-#if ME_WIN && KEEP
-    if (access(path, omode) < 0) {
-        if (*path == '/') {
-            path = sjoin(fs->cygwin, path, NULL);
-        }
+    if (flags & MPR_MANAGE_MARK) {
+        mprMark(dp->name);
     }
-#endif
-    return access(path, omode) == 0;
 }
 
 
-static int deletePath(MprDiskFileSystem *fs, cchar *path)
+/*
+    This returns a list of MprDirEntry objects
+ */
+static MprList *disk_listDir(MprDiskFileSystem *fs, cchar *path)
+#if ME_WIN_LIKE
 {
-    MprPath     info;
+    HANDLE          h;
+    MprDirEntry     *dp;
+    MprPath         fileInfo;
+    MprList         *list;
+    cchar           *seps;
+    char            *pattern, pbuf[ME_MAX_PATH];
+    WIN32_FIND_DATA findData;
 
-    if (getPathInfo(fs, path, &info) == 0 && info.isDir && !info.isLink) {
-        return rmdir((char*) path);
+    list = mprCreateList(-1, 0);
+    dp = 0;
+
+    if ((pattern = mprJoinPath(path, "*.*")) == 0) {
+        return list;
     }
-#if WINDOWS
-{
-    /*
-        NOTE: Windows delete makes a file pending delete which prevents immediate recreation. Rename and then delete.
-     */
-    int i, err;
-    for (i = 0; i < RETRIES; i++) {
-        if (DeleteFile(wide(path)) != 0) {
-            return 0;
-        }
-        err = GetLastError();
-        if (err != ERROR_SHARING_VIOLATION) {
-            break;
-        }
-        mprNap(10);
+    seps = mprGetPathSeparators(path);
+
+    h = FindFirstFile(wide(pattern), &findData);
+    if (h == INVALID_HANDLE_VALUE) {
+        return list;
     }
-    return MPR_ERR_CANT_DELETE;
-}
+    do {
+        if (findData.cFileName[0] == '.' && (findData.cFileName[1] == '\0' || findData.cFileName[1] == '.')) {
+            continue;
+        }
+        if ((dp = mprAllocObj(MprDirEntry, manageDirEntry)) == 0) {
+            return list;
+        }
+        dp->name = awtom(findData.cFileName, 0);
+        if (dp->name == 0) {
+            return list;
+        }
+        /* dp->lastModified = (uint) findData.ftLastWriteTime.dwLowDateTime; */
+
+        if (fmt(pbuf, sizeof(pbuf), "%s%c%s", path, seps[0], dp->name) < 0) {
+            dp->lastModified = 0;
+        } else {
+            mprGetPathInfo(pbuf, &fileInfo);
+            dp->lastModified = fileInfo.mtime;
+        }
+        dp->isDir = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+        dp->isLink = 0;
+
+#if KEEP_64_BIT
+        if (findData.nFileSizeLow < 0) {
+            dp->size = (((uint64) findData.nFileSizeHigh) * INT64(4294967296)) + (4294967296L -
+                (uint64) findData.nFileSizeLow);
+        } else {
+            dp->size = (((uint64) findData.nFileSizeHigh * INT64(4294967296))) + (uint64) findData.nFileSizeLow;
+        }
 #else
-    return unlink((char*) path);
+        dp->size = (uint) findData.nFileSizeLow;
 #endif
+        mprAddItem(list, dp);
+    } while (FindNextFile(h, &findData) != 0);
+
+    FindClose(h);
+    return list;
 }
 
+#else /* !WIN */
+{
+    DIR             *dir;
+    MprPath         fileInfo;
+    MprList         *list;
+    struct dirent   *dirent;
+    MprDirEntry     *dp;
+    char            *fileName;
+    int             rc;
 
-static int makeDir(MprDiskFileSystem *fs, cchar *path, int perms, int owner, int group)
+    list = mprCreateList(256, 0);
+    if ((dir = opendir((char*) path)) == 0) {
+        return list;
+    }
+    while ((dirent = readdir(dir)) != 0) {
+        if (dirent->d_name[0] == '.' && (dirent->d_name[1] == '\0' || dirent->d_name[1] == '.')) {
+            continue;
+        }
+        fileName = mprJoinPath(path, dirent->d_name);
+        /* workaround for if target of symlink does not exist */
+        fileInfo.isLink = 0;
+        fileInfo.isDir = 0;
+        rc = mprGetPathInfo(fileName, &fileInfo);
+        if ((dp = mprAllocObj(MprDirEntry, manageDirEntry)) == 0) {
+            closedir(dir);
+            return list;
+        }
+        dp->name = sclone(dirent->d_name);
+        if (dp->name == 0) {
+            closedir(dir);
+            return list;
+        }
+        if (rc == 0 || fileInfo.isLink) {
+            dp->lastModified = fileInfo.mtime;
+            dp->size = fileInfo.size;
+            dp->isDir = fileInfo.isDir;
+            dp->isLink = fileInfo.isLink;
+        } else {
+            dp->lastModified = 0;
+            dp->size = 0;
+            dp->isDir = 0;
+            dp->isLink = 0;
+        }
+        mprAddItem(list, dp);
+    }
+    closedir(dir);
+    return list;
+}
+#endif /* !WIN */
+
+
+static int disk_makeDir(MprDiskFileSystem *fs, cchar *path, int perms, int owner, int group)
 {
     int     rc;
 
@@ -9052,7 +9198,7 @@ static int makeDir(MprDiskFileSystem *fs, cchar *path, int perms, int owner, int
 }
 
 
-static int makeLink(MprDiskFileSystem *fs, cchar *path, cchar *target, int hard)
+static int disk_makeLink(MprDiskFileSystem *fs, cchar *path, cchar *target, int hard)
 {
 #if ME_UNIX_LIKE
     if (hard) {
@@ -9066,7 +9212,7 @@ static int makeLink(MprDiskFileSystem *fs, cchar *path, cchar *target, int hard)
 }
 
 
-static int getPathInfo(MprDiskFileSystem *fs, cchar *path, MprPath *info)
+static int disk_getPathInfo(MprDiskFileSystem *fs, cchar *path, MprPath *info)
 {
 #if ME_WIN_LIKE
     struct __stat64     s;
@@ -9221,7 +9367,8 @@ static int getPathInfo(MprDiskFileSystem *fs, cchar *path, MprPath *info)
     return 0;
 }
 
-static char *getPathLink(MprDiskFileSystem *fs, cchar *path)
+
+static char *disk_getPathLink(MprDiskFileSystem *fs, cchar *path)
 {
 #if ME_UNIX_LIKE
     char    pbuf[ME_MAX_PATH];
@@ -9238,7 +9385,7 @@ static char *getPathLink(MprDiskFileSystem *fs, cchar *path)
 }
 
 
-static int truncateFile(MprDiskFileSystem *fs, cchar *path, MprOff size)
+static int disk_truncateFile(MprDiskFileSystem *fs, cchar *path, MprOff size)
 {
     if (!mprPathExists(path, F_OK)) {
 #if ME_WIN_LIKE && KEEP
@@ -9291,7 +9438,9 @@ static void manageDiskFileSystem(MprDiskFileSystem *dfs, int flags)
     if (flags & MPR_MANAGE_MARK) {
         mprMark(dfs->separators);
         mprMark(dfs->newline);
+#if UNUSED
         mprMark(dfs->root);
+#endif
 #if ME_WIN_LIKE || CYGWIN
         mprMark(dfs->cygdrive);
         mprMark(dfs->cygwin);
@@ -9308,51 +9457,48 @@ PUBLIC MprDiskFileSystem *mprCreateDiskFileSystem(cchar *path)
     if ((dfs = mprAllocObj(MprDiskFileSystem, manageDiskFileSystem)) == 0) {
         return 0;
     }
-    /*
-        Temporary
-     */
     fs = (MprFileSystem*) dfs;
-    dfs->accessPath = accessPath;
-    dfs->deletePath = deletePath;
-    dfs->getPathInfo = getPathInfo;
-    dfs->getPathLink = getPathLink;
-    dfs->makeDir = makeDir;
-    dfs->makeLink = makeLink;
-    dfs->openFile = openFile;
-    dfs->closeFile = closeFile;
-    dfs->readFile = readFile;
-    dfs->seekFile = seekFile;
-    dfs->truncateFile = truncateFile;
-    dfs->writeFile = writeFile;
+    mprInitFileSystem(fs, path);
 
-    if ((MPR->stdError = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdError, "stderr");
-    MPR->stdError->fd = 2;
-    MPR->stdError->fileSystem = fs;
-    MPR->stdError->mode = O_WRONLY;
-
-    if ((MPR->stdInput = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdInput, "stdin");
-    MPR->stdInput->fd = 0;
-    MPR->stdInput->fileSystem = fs;
-    MPR->stdInput->mode = O_RDONLY;
-
-    if ((MPR->stdOutput = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdOutput, "stdout");
-    MPR->stdOutput->fd = 1;
-    MPR->stdOutput->fileSystem = fs;
-    MPR->stdOutput->mode = O_WRONLY;
-
+    dfs->accessPath = disk_accessPath;
+    dfs->deletePath = disk_deletePath;
+    dfs->getPathInfo = disk_getPathInfo;
+    dfs->getPathLink = disk_getPathLink;
+    dfs->listDir = disk_listDir;
+    dfs->makeDir = disk_makeDir;
+    dfs->makeLink = disk_makeLink;
+    dfs->openFile = disk_openFile;
+    dfs->closeFile = disk_closeFile;
+    dfs->readFile = disk_readFile;
+    dfs->seekFile = disk_seekFile;
+    dfs->truncateFile = disk_truncateFile;
+    dfs->writeFile = disk_writeFile;
     return dfs;
 }
-#endif /* !ME_ROM */
 
+#endif /* ME_MPR_DISK */
+
+
+#if KEEP
+/*
+    Open a file with support for cygwin paths. Tries windows path first then under /cygwin.
+ */
+static int cygOpen(MprFileSystem *fs, cchar *path, int omode, int perms)
+{
+    int     fd;
+
+    fd = open(path, omode, MASK_PERMS(perms));
+#if WINDOWS
+    if (fd < 0) {
+        if (*path == '/') {
+            path = sjoin(fs->cygwin, path, NULL);
+        }
+        fd = open(path, omode, MASK_PERMS(perms));
+    }
+#endif
+    return fd;
+}
+#endif
 
 /*
     @copy   default
@@ -11331,6 +11477,19 @@ PUBLIC MprFile *mprGetStdout()
 }
 
 
+PUBLIC MprList *mprGetDirList(cchar *path)
+{
+    MprFileSystem   *fs;
+
+    assert(path && *path);
+
+    if ((fs = mprLookupFileSystem(path)) == 0) {
+        return 0;
+    }
+    return fs->listDir(fs, path);
+}
+
+
 /*
     Get a character from the file. This will put the file into buffered mode.
  */
@@ -11857,17 +12016,8 @@ PUBLIC int mprGetFileFd(MprFile *file)
 
 /************************************ Code ************************************/
 
-PUBLIC MprFileSystem *mprCreateFileSystem(cchar *path)
+PUBLIC void mprInitFileSystem(MprFileSystem *fs, cchar *path)
 {
-    MprFileSystem   *fs;
-    char            *cp;
-
-#if ME_ROM
-    fs = (MprFileSystem*) mprCreateRomFileSystem(path);
-#else
-    fs = (MprFileSystem*) mprCreateDiskFileSystem(path);
-#endif
-
 #if ME_WIN_LIKE
     fs->separators = sclone("\\/");
     fs->newline = sclone("\r\n");
@@ -11889,18 +12039,28 @@ PUBLIC MprFileSystem *mprCreateFileSystem(cchar *path)
     fs->hasDriveSpecs = 1;
 #endif
 
-    if (MPR->fileSystem == NULL) {
-        MPR->fileSystem = fs;
-    }
+#if UNUSED
+    char    *cp;
     fs->root = mprGetAbsPath(path);
     if ((cp = strpbrk(fs->root, fs->separators)) != 0) {
         *++cp = '\0';
     }
+#else
+    fs->root = sclone(path);
+#endif
 #if ME_WIN_LIKE || CYGWIN
     fs->cygwin = mprReadRegistry("HKEY_LOCAL_MACHINE\\SOFTWARE\\Cygwin\\setup", "rootdir");
     fs->cygdrive = sclone("/cygdrive");
 #endif
-    return fs;
+}
+
+
+static int sortFs(MprFileSystem **fs1, MprFileSystem **fs2)
+{
+    int     rc;
+
+    rc = scmp((*fs1)->root, (*fs2)->root);
+    return -rc;
 }
 
 
@@ -11908,17 +12068,28 @@ PUBLIC void mprAddFileSystem(MprFileSystem *fs)
 {
     assert(fs);
 
-    /* NOTE: this does not currently add a file system. It merely replaces the existing file system. */
-    MPR->fileSystem = fs;
+    /*
+        Sort in reverse order. This ensures lower down roots (longer) will be examined first
+     */
+    mprAddItem(MPR->fileSystems, fs);
+    mprSortList(MPR->fileSystems, (MprSortProc) sortFs, 0);
 }
 
 
-/*
-    Note: path can be null
- */
 PUBLIC MprFileSystem *mprLookupFileSystem(cchar *path)
 {
-    return MPR->fileSystem;
+    MprFileSystem   *fs;
+    int             next;
+
+    if (!path || *path == 0) {
+        path = "/";
+    }
+    for (ITERATE_ITEMS(MPR->fileSystems, fs, next)) {
+        if (sstarts(path, fs->root)) {
+            return fs;
+        }
+    }
+    return mprGetLastItem(MPR->fileSystems);
 }
 
 
@@ -15894,7 +16065,7 @@ PUBLIC int mprStartLogging(cchar *logSpec, int flags)
         file = MPR->stdOutput;
     } else if (strcmp(path, "stderr") == 0) {
         file = MPR->stdError;
-#if !ME_ROM
+#if ME_DISK
     } else {
         MprPath     info;
         int         mode;
@@ -16042,7 +16213,7 @@ static void logOutput(cchar *tags, int level, cchar *msg)
 
 static void backupLog()
 {
-#if !ME_ROM
+#if ME_DISK
     MprPath     info;
     MprFile     *file;
     int         mode;
@@ -16501,7 +16672,6 @@ static void manageMimeType(MprMime *mt, int flags);
 PUBLIC MprHash *mprCreateMimeTypes(cchar *path)
 {
     MprHash     *table;
-#if !ME_ROM
     MprFile     *file;
     char        *buf, *tok, *ext, *type;
     int         line;
@@ -16533,9 +16703,7 @@ PUBLIC MprHash *mprCreateMimeTypes(cchar *path)
         }
         mprCloseFile(file);
 
-    } else 
-#endif
-    {
+    } else {
         if ((table = mprCreateHash(MIME_HASH_SIZE, MPR_HASH_CASELESS)) == 0) {
             return 0;
         }
@@ -17562,9 +17730,9 @@ static ME_INLINE bool isAbsPath(MprFileSystem *fs, cchar *path)
  */
 static ME_INLINE bool isFullPath(MprFileSystem *fs, cchar *path)
 {
-    assert(fs);
-    assert(path);
-
+    if (!fs || !path) {
+        return 0;
+    }
 #if ME_WIN_LIKE || VXWORKS
 {
     char    *cp, *endDrive;
@@ -17656,10 +17824,17 @@ PUBLIC int mprDeletePath(cchar *path)
     Return an absolute (normalized) path.
     On CYGWIN, this is a cygwin path with forward-slashes and without drive specs.
     Use mprGetWinPath for a windows style path with a drive specifier and back-slashes.
+
+    Get an absolute (canonical) equivalent representation of a path. On windows this path will have
+    back-slash directory separators and will have a drive specifier. On Cygwin, the path will be a Cygwin style
+    path with forward-slash directory specifiers and without a drive specifier. If the path is outside the
+    cygwin filesystem (outside c:/cygwin), the path will have a /cygdrive/DRIVE prefix. To get a windows style
+    path on *NIX, use mprGetWinPath.
  */
 PUBLIC char *mprGetAbsPath(cchar *path)
 {
     MprFileSystem   *fs;
+    cchar           *dir;
     char            *result;
 
     if (path == 0 || *path == '\0') {
@@ -17696,41 +17871,42 @@ PUBLIC char *mprGetAbsPath(cchar *path)
         mprMapSeparators(result, defaultSep(fs));
         return result;
     }
-
-#if ME_WIN_LIKE
-{
-    wchar    buf[ME_MAX_PATH];
-    GetFullPathName(wide(path), sizeof(buf) - 1, buf, NULL);
-    buf[sizeof(buf) - 1] = '\0';
-    result = mprNormalizePath(multi(buf));
-}
-#elif VXWORKS
-{
-    char    *dir;
-    if (hasDrive(fs, path)) {
+    if (fs == MPR->romfs) {
         dir = mprGetCurrentPath();
-        result = mprJoinPath(dir, &strchr(path, ':')[1]);
-
-    } else {
-        if (isAbsPath(fs, path)) {
-            /*
-                Path is absolute, but without a drive. Use the current drive.
-             */
-            dir = mprGetCurrentPath();
-            result = mprJoinPath(dir, path);
-        } else {
-            dir = mprGetCurrentPath();
-            result = mprJoinPath(dir, path);
-        }
-    }
-}
-#else
-{
-    char   *dir;
-    dir = mprGetCurrentPath();
-    result = mprJoinPath(dir, path);
-}
+        result = mprJoinPath(dir, path);
+#if ME_WIN_LIKE
+        mprMapSeparators(result, '\\');
 #endif
+    } else {
+#if ME_WIN_LIKE
+        /*
+            Get the full path with a drive spec
+         */
+        wchar buf[ME_MAX_PATH];
+        GetFullPathName(wide(path), sizeof(buf) - 1, buf, NULL);
+        buf[sizeof(buf) - 1] = '\0';
+        result = mprNormalizePath(multi(buf));
+#elif VXWORKS
+        if (hasDrive(fs, path)) {
+            dir = mprGetCurrentPath();
+            result = mprJoinPath(dir, &strchr(path, ':')[1]);
+        } else {
+            if (isAbsPath(fs, path)) {
+                /*
+                    Path is absolute, but without a drive. Use the current drive.
+                 */
+                dir = mprGetCurrentPath();
+                result = mprJoinPath(dir, path);
+            } else {
+                dir = mprGetCurrentPath();
+                result = mprJoinPath(dir, path);
+            }
+        }
+#else
+        dir = mprGetCurrentPath();
+        result = mprJoinPath(dir, path);
+#endif
+    }
     return result;
 }
 
@@ -17738,7 +17914,7 @@ PUBLIC char *mprGetAbsPath(cchar *path)
 /*
     Get the directory containing the application executable. Tries to return an absolute path.
  */
-PUBLIC char *mprGetAppDir()
+PUBLIC cchar *mprGetAppDir()
 {
     if (MPR->appDir == 0) {
         MPR->appDir = mprGetPathDir(mprGetAppPath());
@@ -17750,12 +17926,12 @@ PUBLIC char *mprGetAppDir()
 /*
     Get the path for the application executable. Tries to return an absolute path.
  */
-PUBLIC char *mprGetAppPath()
+PUBLIC cchar *mprGetAppPath()
 {
     if (MPR->appPath) {
         return sclone(MPR->appPath);
     }
-#if ME_ROM
+#if !ME_DISK
     MPR->appPath = mprGetCurrentPath();
 #elif MACOSX
 {
@@ -17840,20 +18016,13 @@ PUBLIC char *mprGetAppPath()
 /*
     This will return a fully qualified absolute path for the current working directory.
  */
-PUBLIC char *mprGetCurrentPath()
+PUBLIC cchar *mprGetCurrentPath()
 {
-#if ME_ROM
-    /* 
-        Current directory is always root
-     */
-    return MPR->rootString;
-#else
     char    dir[ME_MAX_PATH];
 
     if (getcwd(dir, sizeof(dir)) == 0) {
         return mprGetAbsPath("/");
     }
-
 #if VXWORKS
 {
     MprFileSystem   *fs;
@@ -17878,7 +18047,6 @@ PUBLIC char *mprGetCurrentPath()
 }
 #endif
     return sclone(dir);
-#endif
 }
 
 
@@ -18029,173 +18197,6 @@ PUBLIC char *mprGetPathExt(cchar *path)
 }
 
 
-static void manageDirEntry(MprDirEntry *dp, int flags)
-{
-    if (flags & MPR_MANAGE_MARK) {
-        mprMark(dp->name);
-    }
-}
-
-
-#if ME_ROM
-static MprList *getDirFiles(cchar *path)
-{
-    MprRomFileSystem    *rfs;
-    MprRomInode         *ri;
-    MprPath             fileInfo;
-    MprList             *list;
-    MprDirEntry         *dp;
-    ssize               len;
-
-    rfs = (MprRomFileSystem*) MPR->fileSystem;
-    list = mprCreateList(256, 0);
-    len = slen(path);
-
-    for (ri = rfs->romInodes; ri->path; ri++) {
-        if (!sstarts(ri->path, path) || !schr(&ri->path[len], '/')) {
-            continue;
-        }
-        fileInfo.isDir = (ri->size == 0);
-        fileInfo.isLink = 0;
-        if ((dp = mprAllocObj(MprDirEntry, manageDirEntry)) == 0) {
-            return list;
-        }
-        dp->name = sclone(ri->path);
-        dp->size = ri->size;
-        dp->isDir = (ri->data == 0);
-        dp->isLink = 0;
-        dp->lastModified = 0;
-        mprAddItem(list, &ri->path[len]);
-    }
-    return list;
-}
-
-#else /* !ME_ROM */
-/*
-    This returns a list of MprDirEntry objects
- */
-#if ME_WIN_LIKE
-static MprList *getDirFiles(cchar *dir)
-{
-    HANDLE          h;
-    MprDirEntry     *dp;
-    MprPath         fileInfo;
-    MprList         *list;
-    cchar           *seps;
-    char            *path, pbuf[ME_MAX_PATH];
-    WIN32_FIND_DATA findData;
-
-    list = mprCreateList(-1, 0);
-    dp = 0;
-
-    if ((path = mprJoinPath(dir, "*.*")) == 0) {
-        return list;
-    }
-    seps = mprGetPathSeparators(dir);
-
-    h = FindFirstFile(wide(path), &findData);
-    if (h == INVALID_HANDLE_VALUE) {
-        return list;
-    }
-    do {
-        if (findData.cFileName[0] == '.' && (findData.cFileName[1] == '\0' || findData.cFileName[1] == '.')) {
-            continue;
-        }
-        if ((dp = mprAlloc(sizeof(MprDirEntry))) == 0) {
-            return list;
-        }
-        dp->name = awtom(findData.cFileName, 0);
-        if (dp->name == 0) {
-            return list;
-        }
-        /* dp->lastModified = (uint) findData.ftLastWriteTime.dwLowDateTime; */
-
-        if (fmt(pbuf, sizeof(pbuf), "%s%c%s", dir, seps[0], dp->name) < 0) {
-            dp->lastModified = 0;
-        } else {
-            mprGetPathInfo(pbuf, &fileInfo);
-            dp->lastModified = fileInfo.mtime;
-        }
-        dp->isDir = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
-        dp->isLink = 0;
-
-#if KEEP_64_BIT
-        if (findData.nFileSizeLow < 0) {
-            dp->size = (((uint64) findData.nFileSizeHigh) * INT64(4294967296)) + (4294967296L -
-                (uint64) findData.nFileSizeLow);
-        } else {
-            dp->size = (((uint64) findData.nFileSizeHigh * INT64(4294967296))) + (uint64) findData.nFileSizeLow;
-        }
-#else
-        dp->size = (uint) findData.nFileSizeLow;
-#endif
-        mprAddItem(list, dp);
-    } while (FindNextFile(h, &findData) != 0);
-
-    FindClose(h);
-    return list;
-}
-
-#else /* !WIN */
-static MprList *getDirFiles(cchar *path)
-{
-    DIR             *dir;
-    MprPath         fileInfo;
-    MprList         *list;
-    struct dirent   *dirent;
-    MprDirEntry     *dp;
-    char            *fileName;
-    int             rc;
-
-    list = mprCreateList(256, 0);
-    if ((dir = opendir((char*) path)) == 0) {
-        return list;
-    }
-    while ((dirent = readdir(dir)) != 0) {
-        if (dirent->d_name[0] == '.' && (dirent->d_name[1] == '\0' || dirent->d_name[1] == '.')) {
-            continue;
-        }
-        fileName = mprJoinPath(path, dirent->d_name);
-        /* workaround for if target of symlink does not exist */
-        fileInfo.isLink = 0;
-        fileInfo.isDir = 0;
-        rc = mprGetPathInfo(fileName, &fileInfo);
-        if ((dp = mprAllocObj(MprDirEntry, manageDirEntry)) == 0) {
-            closedir(dir);
-            return list;
-        }
-        dp->name = sclone(dirent->d_name);
-        if (dp->name == 0) {
-            closedir(dir);
-            return list;
-        }
-        if (rc == 0 || fileInfo.isLink) {
-            dp->lastModified = fileInfo.mtime;
-            dp->size = fileInfo.size;
-            dp->isDir = fileInfo.isDir;
-            dp->isLink = fileInfo.isLink;
-        } else {
-            dp->lastModified = 0;
-            dp->size = 0;
-            dp->isDir = 0;
-            dp->isLink = 0;
-        }
-        mprAddItem(list, dp);
-    }
-    closedir(dir);
-    return list;
-}
-#endif /* !WIN */
-#endif /* !ME_ROM */
-
-#if LINUX
-static int sortFiles(MprDirEntry **dp1, MprDirEntry **dp2)
-{
-    return strcmp((*dp1)->name, (*dp2)->name);
-}
-#endif
-
-
 /*
     Find files in the directory "dir". If base is set, use that as the prefix for returned files.
     Returns a list of MprDirEntry objects.
@@ -18207,7 +18208,7 @@ static MprList *findFiles(MprList *list, cchar *dir, cchar *base, int flags)
     char            *name;
     int             next;
 
-    if ((files = getDirFiles(dir)) == 0) {
+    if ((files = mprGetDirList(dir)) == 0) {
         return 0;
     }
     for (next = 0; (dp = mprGetNextItem(files, &next)) != 0; ) {
@@ -18629,6 +18630,13 @@ PUBLIC int mprGetPathInfo(cchar *path, MprPath *info)
 {
     MprFileSystem  *fs;
 
+    if (!info) {
+        return MPR_ERR_BAD_ARGS;
+    }
+    if (!path) {
+        info->valid = 0;
+        return MPR_ERR_BAD_ARGS;
+    }
     fs = mprLookupFileSystem(path);
     return fs->getPathInfo(fs, path, info);
 }
@@ -18690,7 +18698,8 @@ PUBLIC char *mprGetPortablePath(cchar *path)
 PUBLIC char *mprGetRelPath(cchar *destArg, cchar *originArg)
 {
     MprFileSystem   *fs;
-    char            *dp, *result, *dest, *lastdp, *origin, *op, *lastop;
+    cchar           *dp, *lastdp, *lastop, *op, *origin;
+    char            *result, *dest, *rp;
     int             originSegments, i, commonSegments, sep;
 
     fs = mprLookupFileSystem(destArg);
@@ -18769,19 +18778,19 @@ PUBLIC char *mprGetRelPath(cchar *destArg, cchar *originArg)
     if (isSep(fs, *dp)) {
         dp++;
     }
-    op = result = mprAlloc(originSegments * 3 + slen(dest) + 2);
+    rp = result = mprAlloc(originSegments * 3 + slen(dest) + 2);
     for (i = commonSegments; i < originSegments; i++) {
-        *op++ = '.';
-        *op++ = '.';
-        *op++ = defaultSep(fs);
+        *rp++ = '.';
+        *rp++ = '.';
+        *rp++ = defaultSep(fs);
     }
     if (*dp) {
-        strcpy(op, dp);
-    } else if (op > result) {
+        strcpy(rp, dp);
+    } else if (rp > result) {
         /*
             Cleanup trailing separators ("../" is the end of the new path)
          */
-        op[-1] = '\0';
+        rp[-1] = '\0';
     } else {
         strcpy(result, ".");
     }
@@ -18845,9 +18854,7 @@ PUBLIC char *mprGetWinPath(cchar *path)
     if (path == 0 || *path == '\0') {
         path = ".";
     }
-#if ME_ROM
-    result = mprNormalizePath(path);
-#elif CYGWIN
+#if CYGWIN
 {
     ssize   len;
     if ((len = cygwin_conv_path(CCP_POSIX_TO_WIN_A | CCP_ABSOLUTE, path, NULL, 0)) >= 0) {
@@ -19238,7 +19245,12 @@ PUBLIC void mprMapSeparators(char *path, int separator)
     MprFileSystem   *fs;
     char            *cp;
 
-    fs = mprLookupFileSystem(path);
+    if ((fs = mprLookupFileSystem(path)) == 0) {
+        return;
+    }
+    if (separator == 0) {
+        separator = fs->separators[0];
+    }
     for (cp = path; *cp; cp++) {
         if (isSep(fs, *cp)) {
             *cp = separator;
@@ -19266,6 +19278,9 @@ PUBLIC char *mprReadPathContents(cchar *path, ssize *lenp)
     ssize       len;
     char        *buf;
 
+    if (!path) {
+        return 0;
+    }
     if ((file = mprOpenFile(path, O_RDONLY | O_BINARY, 0)) == 0) {
         return 0;
     }
@@ -19374,6 +19389,9 @@ PUBLIC int mprSamePath(cchar *path1, cchar *path2)
 
     fs = mprLookupFileSystem(path1);
 
+    if (!path1 || !path2) {
+        return 0;
+    }
     /*
         Convert to absolute (normalized) paths to compare.
      */
@@ -19762,7 +19780,7 @@ PUBLIC int mprLoadNativeModule(MprModule *mp)
         mp->path = at;
         mprGetPathInfo(mp->path, &info);
         mp->modified = info.mtime;
-        mprLog("info mpr", 4, "Loading native module %s", mprGetPathBase(mp->path));
+        mprLog("info mpr", 5, "Loading native module %s", mprGetPathBase(mp->path));
         if ((handle = dlopen(mp->path, RTLD_LAZY | RTLD_GLOBAL)) == 0) {
             mprLog("error mpr", 0, "Cannot load module %s, reason: \"%s\"", mp->path, dlerror());
             return MPR_ERR_CANT_OPEN;
@@ -20896,13 +20914,13 @@ PUBLIC ssize print(cchar *fmt, ...)
 
 /********************************** Forwards **********************************/
 
+static int rom_getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info);
 static void manageRomFile(MprFile *file, int flags);
-static int getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info);
-static MprRomInode *lookup(MprRomFileSystem *rfs, cchar *path);
+static MprRomInode *rom_lookup(MprRomFileSystem *rfs, cchar *path);
 
 /*********************************** Code *************************************/
 
-static MprFile *openFile(MprFileSystem *fileSystem, cchar *path, int flags, int omode)
+static MprFile *rom_openFile(MprFileSystem *fileSystem, cchar *path, int flags, int omode)
 {
     MprRomFileSystem    *rfs;
     MprFile             *file;
@@ -20915,7 +20933,7 @@ static MprFile *openFile(MprFileSystem *fileSystem, cchar *path, int flags, int 
     file->mode = omode;
     file->fd = -1;
     file->path = sclone(path);
-    if ((file->inode = lookup(rfs, path)) == 0) {
+    if ((file->inode = rom_lookup(rfs, path)) == 0) {
         return 0;
     }
     return file;
@@ -20933,13 +20951,13 @@ static void manageRomFile(MprFile *file, int flags)
 }
 
 
-static int closeFile(MprFile *file)
+static int rom_closeFile(MprFile *file)
 {
     return 0;
 }
 
 
-static ssize readFile(MprFile *file, void *buf, ssize size)
+static ssize rom_readFile(MprFile *file, void *buf, ssize size)
 {
     MprRomInode     *inode;
     ssize           len;
@@ -20947,7 +20965,7 @@ static ssize readFile(MprFile *file, void *buf, ssize size)
     assert(buf);
 
     if (file->fd == 0) {
-        return read(file->fd, buf, size);
+        return read(file->fd, buf, (uint) size);
     }
     inode = file->inode;
     len = min(inode->size - file->iopos, size);
@@ -20958,16 +20976,16 @@ static ssize readFile(MprFile *file, void *buf, ssize size)
 }
 
 
-static ssize writeFile(MprFile *file, cvoid *buf, ssize size)
+static ssize rom_writeFile(MprFile *file, cvoid *buf, ssize size)
 {
     if (file->fd == 1 || file->fd == 2) {
-        return write(file->fd, buf, size);
+        return write(file->fd, buf, (uint) size);
     }
     return MPR_ERR_CANT_WRITE;
 }
 
 
-static long seekFile(MprFile *file, int seekType, long distance)
+static MprOff rom_seekFile(MprFile *file, int seekType, long distance)
 {
     MprRomInode     *inode;
 
@@ -20995,32 +21013,33 @@ static long seekFile(MprFile *file, int seekType, long distance)
 }
 
 
-static bool accessPath(MprRomFileSystem *fileSystem, cchar *path, int omode)
+static bool rom_accessPath(MprRomFileSystem *fileSystem, cchar *path, int omode)
 {
     MprPath     info;
-    return getPathInfo(fileSystem, path, &info) == 0 ? 1 : 0;
+
+    return rom_getPathInfo(fileSystem, path, &info) == 0 ? 1 : 0;
 }
 
 
-static int deletePath(MprRomFileSystem *fileSystem, cchar *path)
+static int rom_deletePath(MprRomFileSystem *fileSystem, cchar *path)
 {
     return MPR_ERR_CANT_WRITE;
 }
 
 
-static int makeDir(MprRomFileSystem *fileSystem, cchar *path, int perms, int owner, int group)
+static int rom_makeDir(MprRomFileSystem *fileSystem, cchar *path, int perms, int owner, int group)
 {
     return MPR_ERR_CANT_WRITE;
 }
 
 
-static int makeLink(MprRomFileSystem *fileSystem, cchar *path, cchar *target, int hard)
+static int rom_makeLink(MprRomFileSystem *fileSystem, cchar *path, cchar *target, int hard)
 {
     return MPR_ERR_CANT_WRITE;
 }
 
 
-static int getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info)
+static int rom_getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info)
 {
     MprRomInode *ri;
 
@@ -21028,7 +21047,7 @@ static int getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info)
     memset(info, 0, sizeof(MprPath));
     info->checked = 1;
 
-    if ((ri = (MprRomInode*) lookup(rfs, path)) == 0) {
+    if ((ri = (MprRomInode*) rom_lookup(rfs, path)) == 0) {
         return MPR_ERR_CANT_FIND;
     }
     info->valid = 1;
@@ -21047,20 +21066,65 @@ static int getPathInfo(MprRomFileSystem *rfs, cchar *path, MprPath *info)
 }
 
 
-static int getPathLink(MprRomFileSystem *rfs, cchar *path)
+static int rom_getPathLink(MprRomFileSystem *rfs, cchar *path)
 {
     /* Links not supported on ROMfs */
     return -1;
 }
 
 
-static MprRomInode *lookup(MprRomFileSystem *rfs, cchar *path)
+static void manageRomDirEntry(MprDirEntry *dp, int flags)
 {
+    if (flags & MPR_MANAGE_MARK) {
+        mprMark(dp->name);
+    }
+}
+
+
+static MprList *rom_listDir(cchar *path)
+{
+    MprRomFileSystem    *rfs;
+    MprRomInode         *ri;
+    MprPath             fileInfo;
+    MprList             *list;
+    MprDirEntry         *dp;
+    ssize               len;
+
+    rfs = (MprRomFileSystem*) MPR->romfs;
+    list = mprCreateList(256, 0);
+    len = slen(path);
+
+    for (ri = rfs->romInodes; ri->path; ri++) {
+        if (!sstarts(ri->path, path) || !schr(&ri->path[len], '/')) {
+            continue;
+        }
+        fileInfo.isDir = (ri->size == 0);
+        fileInfo.isLink = 0;
+        if ((dp = mprAllocObj(MprDirEntry, manageRomDirEntry)) == 0) {
+            return list;
+        }
+        dp->name = sclone(ri->path);
+        dp->size = ri->size;
+        dp->isDir = (ri->data == 0);
+        dp->isLink = 0;
+        dp->lastModified = 0;
+        mprAddItem(list, &ri->path[len]);
+    }
+    return list;
+}
+
+
+static MprRomInode *rom_lookup(MprRomFileSystem *rfs, cchar *path)
+{
+    MprRomInode     *ri;
+    cchar           *seps;
+
+    seps = rfs->fileSystem.separators;
     if (path == 0) {
         return 0;
     }
     /*
-        Remove "./" segments
+        Step over "./" segments
      */
     while (*path == '.') {
         if (path[1] == '\0') {
@@ -21071,30 +21135,24 @@ static MprRomInode *lookup(MprRomFileSystem *rfs, cchar *path)
             break;
         }
     }
-    if (path[0] == '/') {
-        return (MprRomInode*) mprLookupKey(rfs->fileIndex, path);
+    if (path[0] == seps[0] || path[0] == '/') {
+        ri = (MprRomInode*) mprLookupKey(rfs->fileIndex, path);
     } else {
-        return (MprRomInode*) mprLookupKey(rfs->fileIndex, mprJoinPath(mprGetCurrentPath(), path));
+        ri = (MprRomInode*) mprLookupKey(rfs->fileIndex, mprJoinPath(mprGetCurrentPath(), path));
     }
-}
-
-
-PUBLIC int mprSetRomFileSystem(MprRomInode *inodeList)
-{
-    MprRomFileSystem    *rfs;
-    MprRomInode         *ri;
-
-    rfs = (MprRomFileSystem*) MPR->fileSystem;
-    rfs->romInodes = inodeList;
-    rfs->fileIndex = mprCreateHash(ME_MAX_ROMFS, MPR_HASH_STATIC_KEYS | MPR_HASH_STATIC_VALUES);
-
-    for (ri = inodeList; ri->path; ri++) {
-        if (mprAddKey(rfs->fileIndex, ri->path, ri) < 0) {
-            assert(!MPR_ERR_MEMORY);
-            return MPR_ERR_MEMORY;
+#if ME_WIN_LIKE
+    if (!ri && schr(path, '/')) {
+        char    buf[ME_MAX_PATH];
+        scopy(buf, sizeof(buf), path);
+        mprMapSeparators(buf, '\\');
+        if (buf[0] == '\\') {
+            ri = (MprRomInode*) mprLookupKey(rfs->fileIndex, buf);
+        } else {
+            ri = (MprRomInode*) mprLookupKey(rfs->fileIndex, mprJoinPath(mprGetCurrentPath(), buf));
         }
     }
-    return 0;
+#endif
+    return ri;
 }
 
 
@@ -21114,50 +21172,39 @@ PUBLIC void manageRomFileSystem(MprRomFileSystem *rfs, int flags)
 }
 
 
-PUBLIC MprRomFileSystem *mprCreateRomFileSystem(cchar *path)
+PUBLIC MprRomFileSystem *mprCreateRomFileSystem(cchar *path, MprRomInode *inodes)
 {
-    MprFileSystem      *fs;
-    MprRomFileSystem   *rfs;
+    MprFileSystem       *fs;
+    MprRomFileSystem    *rfs;
+    MprRomInode         *ri;
 
     if ((rfs = mprAllocObj(MprRomFileSystem, manageRomFileSystem)) == 0) {
         return rfs;
     }
+    MPR->romfs = (MprFileSystem*) rfs;
+    rfs->romInodes = inodes;
+    rfs->fileIndex = mprCreateHash(ME_MAX_ROMFS, MPR_HASH_STATIC_KEYS | MPR_HASH_STATIC_VALUES);
+
+    for (ri = inodes; ri && ri->path; ri++) {
+        if (mprAddKey(rfs->fileIndex, ri->path, ri) < 0) {
+            return 0;
+        }
+    }
     fs = &rfs->fileSystem;
-    fs->accessPath = (MprAccessFileProc) accessPath;
-    fs->deletePath = (MprDeleteFileProc) deletePath;
-    fs->getPathInfo = (MprGetPathInfoProc) getPathInfo;
-    fs->getPathLink = (MprGetPathLinkProc) getPathLink;
-    fs->makeDir = (MprMakeDirProc) makeDir;
-    fs->makeLink = (MprMakeLinkProc) makeLink;
-    fs->openFile = (MprOpenFileProc) openFile;
-    fs->closeFile = (MprCloseFileProc) closeFile;
-    fs->readFile = (MprReadFileProc) readFile;
-    fs->seekFile = (MprSeekFileProc) seekFile;
-    fs->writeFile = (MprWriteFileProc) writeFile;
+    mprInitFileSystem(fs, path);
+    fs->accessPath = (MprAccessFileProc) rom_accessPath;
+    fs->deletePath = (MprDeleteFileProc) rom_deletePath;
+    fs->getPathInfo = (MprGetPathInfoProc) rom_getPathInfo;
+    fs->getPathLink = (MprGetPathLinkProc) rom_getPathLink;
+    fs->listDir = (MprListDirProc) rom_listDir;
+    fs->makeDir = (MprMakeDirProc) rom_makeDir;
+    fs->makeLink = (MprMakeLinkProc) rom_makeLink;
+    fs->openFile = (MprOpenFileProc) rom_openFile;
+    fs->closeFile = (MprCloseFileProc) rom_closeFile;
+    fs->readFile = (MprReadFileProc) rom_readFile;
+    fs->seekFile = (MprSeekFileProc) rom_seekFile;
+    fs->writeFile = (MprWriteFileProc) rom_writeFile;
 
-    if ((MPR->stdError = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdError, "stderr");
-    MPR->stdError->fd = 2;
-    MPR->stdError->fileSystem = fs;
-    MPR->stdError->mode = O_WRONLY;
-
-    if ((MPR->stdInput = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdInput, "stdin");
-    MPR->stdInput->fd = 0;
-    MPR->stdInput->fileSystem = fs;
-    MPR->stdInput->mode = O_RDONLY;
-
-    if ((MPR->stdOutput = mprAllocStruct(MprFile)) == 0) {
-        return NULL;
-    }
-    mprSetName(MPR->stdOutput, "stdout");
-    MPR->stdOutput->fd = 1;
-    MPR->stdOutput->fileSystem = fs;
-    MPR->stdOutput->mode = O_WRONLY;
     return rfs;
 }
 
@@ -22020,6 +22067,7 @@ static void manageSocketProvider(MprSocketProvider *provider, int flags)
 {
     if (flags & MPR_MANAGE_MARK) {
         mprMark(provider->name);
+        mprMark(provider->managed);
     }
 }
 
@@ -22031,7 +22079,7 @@ static MprSocketProvider *createStandardProvider(MprSocketService *ss)
     if ((provider = mprAllocObj(MprSocketProvider, manageSocketProvider)) == 0) {
         return 0;
     }
-    provider->name = sclone("standard");;
+    provider->name = sclone("standard");
     provider->closeSocket = closeSocket;
     provider->disconnectSocket = disconnectSocket;
     provider->flushSocket = flushSocket;
@@ -22905,8 +22953,7 @@ PUBLIC ssize mprWriteSocketVector(MprSocket *sp, MprIOVec *iovec, int count)
 }
 
 
-#if !ME_ROM
-#if !LINUX || __UCLIBC__
+#if !LINUX || __UCLIBC__ || !ME_DISK
 static ssize localSendfile(MprSocket *sp, MprFile *file, MprOff offset, ssize len)
 {
     char    buf[ME_MAX_BUFFER];
@@ -22985,7 +23032,7 @@ PUBLIC MprOff mprSendFileToSocket(MprSocket *sock, MprFile *file, MprOff offset,
         }
 
         if (!done && toWriteFile > 0 && file->fd >= 0) {
-#if LINUX && !__UCLIBC__
+#if LINUX && !__UCLIBC__ && ME_DISK
             off_t off = (off_t) offset;
 #endif
             while (!done && toWriteFile > 0) {
@@ -22993,7 +23040,7 @@ PUBLIC MprOff mprSendFileToSocket(MprSocket *sock, MprFile *file, MprOff offset,
                 if (sock->flags & MPR_SOCKET_BLOCK) {
                     mprYield(MPR_YIELD_STICKY);
                 }
-#if LINUX && !__UCLIBC__
+#if LINUX && !__UCLIBC__ && ME_DISK
     #if ME_COMPILER_HAS_OFF64
                 rc = sendfile64(sock->fd, file->fd, &off, nbytes);
     #else
@@ -23030,7 +23077,6 @@ PUBLIC MprOff mprSendFileToSocket(MprSocket *sock, MprFile *file, MprOff offset,
     }
     return written;
 }
-#endif /* !ME_ROM */
 
 
 static ssize flushSocket(MprSocket *sp)
@@ -23614,6 +23660,7 @@ static void manageSsl(MprSsl *ssl, int flags)
         mprMark(ssl->ciphers);
         mprMark(ssl->config);
         mprMark(ssl->keyFile);
+        mprMark(ssl->hostname);
         mprMark(ssl->mutex);
         mprMark(ssl->revoke);
     }
@@ -23657,11 +23704,9 @@ PUBLIC MprSsl *mprCreateSsl(int server)
     /*
         Sensible defaults
      */
-    ssl->cacheSize = ME_MPR_SSL_CACHE;
+    ssl->ticket = ME_MPR_SSL_TICKET;
     ssl->logLevel = ME_MPR_SSL_LOG_LEVEL;
     ssl->renegotiate = ME_MPR_SSL_RENEGOTIATE;
-    ssl->ticket = ME_MPR_SSL_TICKET;
-    ssl->sessionTimeout = ME_MPR_SSL_TIMEOUT;
 
     ssl->mutex = mprCreateLock();
     return ssl;
@@ -23692,14 +23737,23 @@ PUBLIC int mprLoadSsl()
     MprModule           *mp;
 
     ss = MPR->socketService;
+    mprGlobalLock();
+    if (ss->loaded) {
+        mprGlobalUnlock();
+        return 0;
+    }
     if (ss->sslProvider) {
+        mprGlobalUnlock();
         return 0;
     }
     if ((mp = mprCreateModule("ssl", "builtin", "mprSslInit", NULL)) == 0) {
+        mprGlobalUnlock();
         return MPR_ERR_CANT_CREATE;
     }
     mprSslInit(MPR, mp);
     mprLog("info ssl", 5, "Loaded %s SSL provider", ss->sslProvider->name);
+    ss->loaded++;
+    mprGlobalUnlock();
     return 0;
 #else
     mprLog("error mpr", 0, "SSL communications support not included in build");
@@ -23708,29 +23762,6 @@ PUBLIC int mprLoadSsl()
 }
 
 
-static int loadProvider()
-{
-    MprSocketService    *ss;
-
-    ss = MPR->socketService;
-    mprGlobalLock();
-    if (!ss->sslProvider && mprLoadSsl() < 0) {
-        mprGlobalUnlock();
-        return MPR_ERR_CANT_READ;
-    }
-    if (!ss->sslProvider) {
-        mprLog("error mpr", 0, "Cannot load SSL provider");
-        mprGlobalUnlock();
-        return MPR_ERR_CANT_INITIALIZE;
-    }
-    mprGlobalUnlock();
-    return 0;
-}
-
-
-/*
-    Upgrade a socket to use SSL
- */
 PUBLIC int mprUpgradeSocket(MprSocket *sp, MprSsl *ssl, cchar *peerName)
 {
     MprSocketService    *ss;
@@ -23741,8 +23772,8 @@ PUBLIC int mprUpgradeSocket(MprSocket *sp, MprSsl *ssl, cchar *peerName)
     if (!ssl) {
         return MPR_ERR_BAD_ARGS;
     }
-    if (!ss->sslProvider) {
-        if (loadProvider() < 0) {
+    if (!ss->loaded) {
+        if (mprLoadSsl() < 0) {
             return MPR_ERR_CANT_INITIALIZE;
         }
     }
@@ -23756,6 +23787,12 @@ PUBLIC int mprUpgradeSocket(MprSocket *sp, MprSsl *ssl, cchar *peerName)
 }
 
 
+PUBLIC void mprSetSslMatch(MprSsl *ssl, MprMatchSsl match)
+{
+    ssl->matchSsl = match;
+}
+
+
 PUBLIC void mprAddSslCiphers(MprSsl *ssl, cchar *ciphers)
 {
     assert(ssl);
@@ -23764,14 +23801,6 @@ PUBLIC void mprAddSslCiphers(MprSsl *ssl, cchar *ciphers)
     } else {
         ssl->ciphers = sclone(ciphers);
     }
-    ssl->changed = 1;
-}
-
-
-PUBLIC void mprSetSslCacheSize(MprSsl *ssl, int size)
-{
-    assert(ssl);
-    ssl->cacheSize = size;
     ssl->changed = 1;
 }
 
@@ -23824,6 +23853,14 @@ PUBLIC void mprSetSslKeyFile(MprSsl *ssl, cchar *keyFile)
 }
 
 
+PUBLIC void mprSetSslHostname(MprSsl *ssl, cchar *hostname)
+{
+    assert(ssl);
+    ssl->hostname = (hostname && *hostname) ? sclone(hostname) : 0;
+    ssl->changed = 1;
+}
+
+
 PUBLIC void mprSetSslProtocols(MprSsl *ssl, int protocols)
 {
     assert(ssl);
@@ -23852,14 +23889,6 @@ PUBLIC void mprSetSslTicket(MprSsl *ssl, bool enable)
 {
     assert(ssl);
     ssl->ticket = enable;
-    ssl->changed = 1;
-}
-
-
-PUBLIC void mprSetSslTimeout(MprSsl *ssl, MprTicks timeout)
-{
-    assert(ssl);
-    ssl->sessionTimeout = timeout;
     ssl->changed = 1;
 }
 
@@ -26124,6 +26153,18 @@ PUBLIC ssize mprGetBusyWorkerCount()
     return count;
 }
 
+
+PUBLIC bool mprSetThreadYield(MprThread *tp, bool on)
+{
+    bool    prior;
+
+    if (!tp) {
+        tp = mprGetCurrentThread();
+    }
+    prior = !tp->noyield;
+    tp->noyield = !on;
+    return prior;
+}
 
 /*
     @copy   default
